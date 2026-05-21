@@ -1,0 +1,83 @@
+WIDTH, HEIGHT = 1920, 1080
+WORLD_WIDTH, WORLD_HEIGHT = 4000, 4000
+
+FPS = 60
+STATE_BROADCAST_FPS = 20
+
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_BIND = "0.0.0.0"
+DEFAULT_PORT = 50007
+DEFAULT_BOT_COUNT = 8
+
+BG_COLOR = (204, 204, 204)
+GRID_NORMAL = (200, 200, 200)
+GRID_THICK = (190, 190, 190)
+
+WALL_BASE = (187, 187, 187)
+WALL_BORDER = (140, 140, 140)
+
+MINIMAP_WALL = (192, 192, 192)
+MINIMAP_BORDER = (145, 145, 145)
+
+WHITE = (240, 240, 240)
+BLACK = (85, 85, 85)
+GREY = (153, 153, 153)
+BLUE = (0, 178, 225)
+DARK_BLUE = (0, 134, 169)
+YELLOW = (255, 232, 105)
+DARK_YELLOW = (191, 174, 79)
+RED = (252, 118, 119)
+DARK_RED = (189, 88, 89)
+PURPLE = (118, 141, 252)
+DARK_PURPLE = (88, 106, 189)
+
+UI_BG = (60, 60, 60)
+SCORE_COLOR = (102, 230, 166)
+HP_GREEN = (133, 227, 125)
+
+PLAYER_BASE_HP = 50
+PLAYER_BASE_SPEED = 2.35
+PLAYER_SPEED_PER_STAT = 0.24
+PLAYER_BASE_RELOAD_TICKS = 30
+PLAYER_RELOAD_REDUCTION_PER_STAT = 2.0
+PLAYER_MIN_RELOAD_TICKS = 12
+BASE_TANK_RADIUS = 30.0
+RECOIL_FRICTION = 0.85
+
+LEVEL_XP = [
+    0, 4, 13, 28, 50, 78, 113, 157, 211, 275,
+    350, 437, 538, 655, 787, 938, 1109, 1301, 1516, 1757,
+    2026, 2325, 2658, 3026, 3433, 3883, 4379, 4925, 5525, 6184,
+    6907, 7698, 8565, 9511, 10547, 11678, 12912, 14258, 15726, 17325,
+    19067, 20963, 23026, 23536, 23536
+]
+
+SHAPE_STATS = {
+    "square": {"hp": 10, "xp": 10, "radius": 30, "color": (255, 232, 105), "border": (191, 174, 78)},
+    "triangle": {"hp": 30, "xp": 25, "radius": 33, "color": (252, 118, 119), "border": (189, 88, 89)},
+    "pentagon": {"hp": 100, "xp": 130, "radius": 45, "color": (118, 141, 252), "border": (88, 105, 189)},
+}
+
+STAT_NAMES = [
+    "Health Regen",
+    "Max Health",
+    "Body Damage",
+    "Bullet Speed",
+    "Bullet Penetration",
+    "Bullet Damage",
+    "Reload",
+    "Movement Speed",
+]
+
+STAT_COLORS = [
+    (238, 171, 126),
+    (233, 118, 224),
+    (153, 102, 255),
+    (116, 173, 255),
+    (255, 222, 67),
+    (241, 119, 118),
+    (144, 224, 115),
+    (133, 230, 230),
+]
+
+MAX_STAT_LEVEL = 7
