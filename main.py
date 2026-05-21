@@ -3,12 +3,12 @@ import json
 import math
 import os
 import random
-import socket
 import threading
 import time
 from pathlib import Path
 
 import pygame
+import websocket  # pip install websocket-client 필요
 
 from entities import build_barrel_polygon, get_tank_definition
 from server import GameServer
@@ -58,17 +58,13 @@ font_connect = None
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 
-def encode_message(payload):
-    return (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
-
-
 class NetworkClient:
     def __init__(self, host, port, name):
         self.host = host
         self.port = port
         self.name = name
 
-        self.sock = None
+        self.ws = None  # 기존 sock에서 ws로 변경
         self.running = False
         self.receiver = None
         self.send_lock = threading.Lock()
@@ -87,57 +83,54 @@ class NetworkClient:
 
     def connect(self):
         try:
-            self.sock = socket.create_connection((self.host, self.port))
-            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            # 포트가 80번(렌더 표준 HTTP)인 경우 URL 포트 표기를 생략하는 것이 안전합니다.
+            if self.port == 80:
+                ws_url = f"ws://{self.host}/ws"
+            else:
+                ws_url = f"ws://{self.host}:{self.port}/ws"
+
+            # 웹소켓 연결 수립
+            self.ws = websocket.create_connection(ws_url, timeout=5.0)
             self.running = True
+
+            # 초기 조인 데이터 전송
             self.send({"type": "join", "name": self.name})
+
+            # 비동기 수신 루프 가동
             self.receiver = threading.Thread(target=self.recv_loop, daemon=True)
             self.receiver.start()
             return True
-        except OSError:
+        except Exception as e:
+            print(f"WebSocket Connection Failure: {e}")
             return False
 
     def send(self, payload):
-        if not self.running or self.sock is None:
+        if not self.running or self.ws is None:
             return
 
         try:
             with self.send_lock:
-                self.sock.sendall(encode_message(payload))
-        except OSError:
+                # 웹소켓은 줄바꿈(\n)이 필요 없이 객체를 직렬화해서 그대로 내보냅니다.
+                self.ws.send(json.dumps(payload, separators=(",", ":")))
+        except Exception:
             self.error = "Disconnected from server."
             self.close()
 
     def recv_loop(self):
-        buffer = ""
-        self.sock.settimeout(0.25)
-
         try:
             while self.running:
                 try:
-                    chunk = self.sock.recv(65536)
-                except socket.timeout:
-                    continue
-                except OSError:
+                    # 웹소켓은 데이터가 한 프레임 단위로 유실 없이 묶여서 들어옵니다.
+                    message = self.ws.recv()
+                    if not message:
+                        self.error = "Server connection closed."
+                        break
+
+                    payload = json.loads(message)
+                    self.handle_message(payload)
+                except Exception:
                     self.error = "Disconnected from server."
                     break
-
-                if not chunk:
-                    self.error = "Server connection closed."
-                    break
-
-                buffer += chunk.decode("utf-8")
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    if not line:
-                        continue
-
-                    try:
-                        payload = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-
-                    self.handle_message(payload)
         finally:
             self.close()
 
@@ -158,12 +151,12 @@ class NetworkClient:
             return
 
         self.running = False
-        if self.sock is not None:
+        if self.ws is not None:
             try:
-                self.sock.close()
-            except OSError:
+                self.ws.close()
+            except Exception:
                 pass
-            self.sock = None
+            self.ws = None
 
 
 def get_font(size):
@@ -174,17 +167,8 @@ def get_font(size):
 
 
 def init_client_display():
-    global screen
-    global clock
-    global font_score
-    global font_level
-    global font_stat
-    global font_point
-    global font_scoreboard_title
-    global font_summary_title
-    global font_summary_text
-    global font_name
-    global font_connect
+    global screen, clock, font_score, font_level, font_stat, font_point
+    global font_scoreboard_title, font_summary_title, font_summary_text, font_name, font_connect
 
     pygame.init()
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
@@ -341,11 +325,13 @@ def draw_hud(surface, player, leaderboard):
 
     prev_xp = LEVEL_XP[player["level"] - 1] if player["level"] > 1 else 0
     next_xp = LEVEL_XP[player["level"]] if player["level"] < 45 else player["xp"]
-    xp_ratio = 1.0 if player["level"] == 45 else max(0.0, min(1.0, (player["xp"] - prev_xp) / max(1, next_xp - prev_xp)))
+    xp_ratio = 1.0 if player["level"] == 45 else max(0.0,
+                                                     min(1.0, (player["xp"] - prev_xp) / max(1, next_xp - prev_xp)))
 
     pygame.draw.rect(surface, UI_BG, (level_x, level_y, level_bar_w, level_bar_h), border_radius=11)
     if xp_ratio > 0:
-        pygame.draw.rect(surface, YELLOW, (level_x, level_y, int(level_bar_w * xp_ratio), level_bar_h), border_radius=11)
+        pygame.draw.rect(surface, YELLOW, (level_x, level_y, int(level_bar_w * xp_ratio), level_bar_h),
+                         border_radius=11)
     pygame.draw.rect(surface, BLACK, (level_x, level_y, level_bar_w, level_bar_h), 4, border_radius=11)
     draw_text_outlined(
         surface,
@@ -363,9 +349,11 @@ def draw_hud(surface, player, leaderboard):
     score_ratio = max(0.0, min(1.0, player["xp"] / max(1, top_score)))
 
     pygame.draw.rect(surface, UI_BG, (score_x, score_y, score_bar_w, score_bar_h), border_radius=8)
-    pygame.draw.rect(surface, SCORE_COLOR, (score_x, score_y, int(score_bar_w * score_ratio), score_bar_h), border_radius=8)
+    pygame.draw.rect(surface, SCORE_COLOR, (score_x, score_y, int(score_bar_w * score_ratio), score_bar_h),
+                     border_radius=8)
     pygame.draw.rect(surface, BLACK, (score_x, score_y, score_bar_w, score_bar_h), 4, border_radius=8)
-    draw_text_outlined(surface, f"Score: {int(player['xp'])}", font_score, WHITE, score_x + score_bar_w // 2, score_y + score_bar_h // 2)
+    draw_text_outlined(surface, f"Score: {int(player['xp'])}", font_score, WHITE, score_x + score_bar_w // 2,
+                       score_y + score_bar_h // 2)
 
 
 def draw_leaderboard(surface, player_id, leaderboard):
@@ -451,7 +439,8 @@ def draw_upgrade_ui(surface, player):
         pygame.draw.rect(surface, UI_BG, bar_rect, border_radius=12)
         if level > 0:
             fill_w = int((gauge_w / 7) * level)
-            pygame.draw.rect(surface, color, (start_x, y_pos, fill_w, bar_h), border_top_left_radius=12, border_bottom_left_radius=12)
+            pygame.draw.rect(surface, color, (start_x, y_pos, fill_w, bar_h), border_top_left_radius=12,
+                             border_bottom_left_radius=12)
         if level < 7:
             plus_rect = pygame.Rect(start_x + gauge_w, y_pos, plus_w, bar_h)
             pygame.draw.rect(surface, color, plus_rect, border_top_right_radius=12, border_bottom_right_radius=12)
@@ -521,13 +510,16 @@ def draw_death_overlay(surface, player):
     surface.blit(overlay, (0, 0))
 
     draw_text_outlined(surface, "You were killed by", font_summary_text, WHITE, WIDTH // 2, HEIGHT // 2 - 120)
-    draw_text_outlined(surface, player["killer_name"] or "Unknown", font_summary_title, WHITE, WIDTH // 2, HEIGHT // 2 - 80)
+    draw_text_outlined(surface, player["killer_name"] or "Unknown", font_summary_title, WHITE, WIDTH // 2,
+                       HEIGHT // 2 - 80)
     draw_text_outlined(surface, f"Score: {int(player['xp'])}", font_summary_text, WHITE, WIDTH // 2, HEIGHT // 2)
     draw_text_outlined(surface, f"Level: {player['level']}", font_summary_text, WHITE, WIDTH // 2, HEIGHT // 2 + 30)
-    draw_text_outlined(surface, f"Time: {player['time_alive']}s", font_summary_text, WHITE, WIDTH // 2, HEIGHT // 2 + 60)
+    draw_text_outlined(surface, f"Time: {player['time_alive']}s", font_summary_text, WHITE, WIDTH // 2,
+                       HEIGHT // 2 + 60)
 
     if (pygame.time.get_ticks() // 500) % 2 == 0:
-        draw_text_outlined(surface, "Press [ENTER] to Respawn", font_summary_text, (0, 200, 255), WIDTH // 2, HEIGHT // 2 + 130)
+        draw_text_outlined(surface, "Press [ENTER] to Respawn", font_summary_text, (0, 200, 255), WIDTH // 2,
+                           HEIGHT // 2 + 130)
 
 
 def draw_connection_overlay(surface, text):
@@ -641,7 +633,7 @@ def draw_class_tree_overlay(surface, player):
     title = "Class Tree (hold Y)"
     subtitle = f"Current: {current_tank}" if player else "Current: Tank"
     draw_text_outlined(surface, title, font_level, WHITE, WIDTH // 2, 28)
-    draw_text_outlined(surface, subtitle, font_stat, WHITE, WIDTH // 2, 60)
+    draw_text_outlined(surface, subtitle, font_stat, WHITE, WHITE, WIDTH // 2, 60)
 
 
 def parse_args():
@@ -650,7 +642,8 @@ def parse_args():
     parser.add_argument("--server", action="store_true", help="Run only the dedicated server.")
     parser.add_argument("--bind", default=DEFAULT_BIND, help="Address for the local server to bind to.")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="TCP port for the game server.")
-    parser.add_argument("--bots", type=int, default=DEFAULT_BOT_COUNT, help="How many AI bots the server should maintain.")
+    parser.add_argument("--bots", type=int, default=DEFAULT_BOT_COUNT,
+                        help="How many AI bots the server should maintain.")
     parser.add_argument("--name", help="Player name shown in the scoreboard.")
     return parser.parse_args()
 
@@ -718,7 +711,8 @@ def run_client(host, port, name):
                 elif pygame.K_1 <= event.key <= pygame.K_8:
                     stat_idx = event.key - pygame.K_1
                     keys_pressed = pygame.key.get_pressed()
-                    client.send({"type": "upgrade", "stat": stat_idx, "bulk": keys_pressed[pygame.K_m] or keys_pressed[pygame.K_u]})
+                    client.send({"type": "upgrade", "stat": stat_idx,
+                                 "bulk": keys_pressed[pygame.K_m] or keys_pressed[pygame.K_u]})
 
                 if event.key == pygame.K_e:
                     auto_fire = not auto_fire
@@ -817,7 +811,7 @@ def main():
 
     if args.server:
         server = GameServer(args.bind, args.port, bot_count=args.bots)
-        print(f"Server listening on {args.bind}:{args.port}")
+        print(f"WebSocket Server listening on {args.bind}:{args.port}")
         server.start(background=False)
         return
 
@@ -828,8 +822,8 @@ def main():
         embedded_server = GameServer(args.bind, args.port, bot_count=args.bots)
         embedded_server.start(background=True)
         connect_host = DEFAULT_HOST
-        print(f"Local host started on {args.bind}:{args.port}")
-        time.sleep(0.3)
+        print(f"Local WebSocket host started on {args.bind}:{args.port}")
+        time.sleep(0.5)
 
     try:
         run_client(connect_host, args.port, name)

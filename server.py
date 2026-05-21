@@ -1,244 +1,135 @@
+import asyncio
 import json
-import socket
-import threading
-import time
-
-from settings import DEFAULT_BOT_COUNT, FPS, STATE_BROADCAST_FPS
+import uuid
+from settings import DEFAULT_BOT_COUNT, FPS, STATE_BROADCAST_FPS, WORLD_WIDTH, WORLD_HEIGHT
 from world import MazeWorld
 
 
-def encode_message(payload):
-    return (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
-
-
-class ClientConnection:
-    def __init__(self, server, sock, address):
-        self.server = server
-        self.sock = sock
-        self.address = address
-        self.player_id = None
-        self.alive = True
-        self.send_lock = threading.Lock()
-        self.thread = threading.Thread(target=self.recv_loop, daemon=True)
-
-    def start(self):
-        self.thread.start()
-
-    def send(self, payload):
-        if not self.alive:
-            return
-
-        try:
-            with self.send_lock:
-                self.sock.sendall(encode_message(payload))
-        except OSError:
-            self.close()
-
-    def recv_loop(self):
-        buffer = ""
-        self.sock.settimeout(0.25)
-
-        try:
-            while self.alive and self.server.running:
-                try:
-                    chunk = self.sock.recv(65536)
-                except socket.timeout:
-                    continue
-
-                if not chunk:
-                    break
-
-                buffer += chunk.decode("utf-8")
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    if not line:
-                        continue
-
-                    try:
-                        payload = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-
-                    self.handle_message(payload)
-        finally:
-            self.close()
-
-    def handle_message(self, payload):
-        message_type = payload.get("type")
-
-        if message_type == "join" and self.player_id is None:
-            with self.server.world_lock:
-                player = self.server.world.add_player(payload.get("name", "Player"))
-                self.player_id = player.entity_id
-                welcome = self.server.world.build_welcome(self.player_id)
-                snapshot = self.server.world.build_snapshot_for_player(self.player_id)
-
-            self.send(welcome)
-            self.send(snapshot)
-            return
-
-        if self.player_id is None:
-            return
-
-        if message_type == "input":
-            with self.server.world_lock:
-                self.server.world.update_input(self.player_id, payload)
-            return
-
-        if message_type == "upgrade":
-            stat_index = int(payload.get("stat", -1))
-            if 0 <= stat_index < 8:
-                with self.server.world_lock:
-                    self.server.world.upgrade_player_stat(self.player_id, stat_index, bool(payload.get("bulk")))
-            return
-
-        if message_type == "evolve":
-            tank_type = payload.get("tank_type")
-            if isinstance(tank_type, str):
-                with self.server.world_lock:
-                    self.server.world.evolve_player(self.player_id, tank_type)
-            return
-
-        if message_type == "respawn":
-            with self.server.world_lock:
-                self.server.world.respawn_player(self.player_id)
-
-    def close(self):
-        if not self.alive:
-            return
-
-        self.alive = False
-        try:
-            self.sock.close()
-        except OSError:
-            pass
-
-        self.server.remove_client(self)
-
-
 class GameServer:
-    def __init__(self, host, port, bot_count=DEFAULT_BOT_COUNT):
-        self.host = host
+    def __init__(self, bind_address, port, bot_count=DEFAULT_BOT_COUNT):
+        self.bind_address = bind_address
         self.port = port
         self.bot_count = bot_count
 
-        self.world = MazeWorld(bot_target=bot_count)
-        self.world_lock = threading.Lock()
-
-        self.server_socket = None
-        self.clients = []
-        self.clients_lock = threading.Lock()
-
         self.running = False
-        self.accept_thread = None
-        self.loop_thread = None
+        self.clients = {}  # {websocket_connection: player_id} 구조로 클라이언트 매핑
+        self.world = MazeWorld()
+        self.server_task = None
+
+        # 세계 인프라 및 기본 봇 생성
+        self.world.initialize_maze()
+        for i in range(self.bot_count):
+            self.world.spawn_bot(f"Bot-{random_id()[:4]}")
 
     def start(self, background=False):
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_socket.bind((self.host, self.port))
-        self.server_socket.listen()
-        self.server_socket.settimeout(0.25)
-
+        import websockets
         self.running = True
-        self.accept_thread = threading.Thread(target=self.accept_loop, daemon=True)
-        self.accept_thread.start()
 
-        if background:
-            self.loop_thread = threading.Thread(target=self.run_loop, daemon=True)
-            self.loop_thread.start()
-            return
-
-        self.run_loop()
-
-    def accept_loop(self):
-        while self.running:
-            try:
-                client_sock, address = self.server_socket.accept()
-                client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-
-                connection = ClientConnection(self, client_sock, address)
-                with self.clients_lock:
-                    self.clients.append(connection)
-                connection.start()
-
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-
-    def remove_client(self, connection):
-        with self.clients_lock:
-            if connection in self.clients:
-                self.clients.remove(connection)
-
-        if connection.player_id is not None:
-            with self.world_lock:
-                self.world.remove_player(connection.player_id)
-
-    def broadcast(self, payload):
-        with self.clients_lock:
-            clients = list(self.clients)
-
-        for client in clients:
-            client.send(payload)
-
-    def _collect_snapshot_messages(self):
-        with self.clients_lock:
-            clients = [client for client in self.clients if client.player_id is not None]
-
-        with self.world_lock:
-            messages = []
-            for client in clients:
-                snapshot = self.world.build_snapshot_for_player(client.player_id)
-                if snapshot is not None:
-                    messages.append((client, snapshot))
-
-        return messages
-
-    def run_loop(self):
-        tick_length = 1.0 / FPS
-        broadcast_every = max(1, FPS // STATE_BROADCAST_FPS)
-
+        # 이벤트 루프 가져오기
         try:
-            while self.running:
-                started_at = time.perf_counter()
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
 
-                with self.world_lock:
-                    self.world.tick()
-                    should_broadcast = self.world.tick_count % broadcast_every == 0
-
-                if should_broadcast:
-                    for client, snapshot in self._collect_snapshot_messages():
-                        client.send(snapshot)
-
-                target_time = started_at + tick_length
-
-                sleep_duration = target_time - time.perf_counter() - 0.002
-                if sleep_duration > 0:
-                    time.sleep(sleep_duration)
-
-                while time.perf_counter() < target_time:
-                    pass
-
-        finally:
-            self.stop()
+        # 서버 비동기 태스크 생성
+        if background:
+            self.server_task = loop.create_task(self.run_server_async())
+        else:
+            print(f"Starting Dedicated WebSocket Server on {self.bind_address}:{self.port}")
+            loop.run_until_complete(self.run_server_async())
 
     def stop(self):
-        if not self.running:
-            return
-
         self.running = False
+        if self.server_task:
+            self.server_task.cancel()
 
-        if self.server_socket is not None:
-            try:
-                self.server_socket.close()
-            except OSError:
-                pass
-            self.server_socket = None
+    async def run_server_async(self):
+        import websockets
+        # 외부 수신을 감당할 웹소켓 서버 바인딩
+        async with websockets.serve(self.handler, self.bind_address, self.port):
+            # 물리 엔진 연동 및 상태 브로드캐스트 전송 루프 동시 가동
+            await asyncio.gather(self.physics_loop(), self.broadcast_loop())
 
-        with self.clients_lock:
-            clients = list(self.clients)
+    async def handler(self, websocket, path):
+        player_id = None
+        try:
+            async for message in websocket:
+                if not self.running:
+                    break
 
-        for client in clients:
-            client.close()
+                payload = json.loads(message)
+                msg_type = payload.get("type")
+
+                if msg_type == "join":
+                    # 유저 추가 및 고유 세션 할당
+                    player_name = payload.get("name", "Unknown")[:12]
+                    player_id = str(uuid.uuid4())
+                    self.clients[websocket] = player_id
+                    self.world.spawn_player(player_id, player_name)
+
+                    # 방 구조(벽 정보) 및 초기 환영 패킷 전송
+                    walls_data = [{"x": w.x, "y": w.y, "w": w.w, "h": w.h} for w in self.world.walls]
+                    welcome = {"type": "welcome", "player_id": player_id, "walls": walls_data}
+                    await websocket.send(json.dumps(welcome))
+
+                elif msg_type == "input" and player_id:
+                    # 유저 조작 패킷 업데이트
+                    self.world.update_player_input(player_id, payload)
+
+                elif msg_type == "upgrade" and player_id:
+                    # 능력치 강화 시스템 반영
+                    self.world.upgrade_player_stat(player_id, payload.get("stat"), payload.get("bulk", False))
+
+                elif msg_type == "evolve" and player_id:
+                    # 전직 트리 반영
+                    self.world.evolve_player_tank(player_id, payload.get("tank_type"))
+
+                elif msg_type == "respawn" and player_id:
+                    # 부활 처리
+                    self.world.respawn_player(player_id)
+
+        except Exception as e:
+            print(f"Session disconnected with exception: {e}")
+        finally:
+            # 커넥션 파기 시 메모리 해제
+            if websocket in self.clients:
+                p_id = self.clients[websocket]
+                self.world.remove_player(p_id)
+                del self.clients[websocket]
+
+    async def physics_loop(self):
+        """서버 내부 게임 로직 주기적 갱신 루프 (FPS 기반)"""
+        dt = 1.0 / FPS
+        while self.running:
+            start_time = asyncio.get_event_loop().time()
+
+            # 세계 상태 업데이트 (물리, 탄막, 충돌 등)
+            self.world.update(dt)
+
+            # 오차 보정 계산을 포함한 정밀 딜레이
+            elapsed = asyncio.get_event_loop().time() - start_time
+            await asyncio.sleep(max(0.0, dt - elapsed))
+
+    async def broadcast_loop(self):
+        """모든 클라이언트에게 실시간 월드 데이터 배송 루프"""
+        dt = 1.0 / STATE_BROADCAST_FPS
+        while self.running:
+            start_time = asyncio.get_event_loop().time()
+
+            if self.clients:
+                # MazeWorld로부터 현재 프레임 직렬화 상태 가져오기
+                state_data = self.world.get_serialized_state()
+                state_data["type"] = "state"
+                message = json.dumps(state_data, separators=(",", ":"))
+
+                # 접속 중인 모든 웹소켓에 동시 브로드캐스트 발송
+                tasks = [ws.send(message) for ws in self.clients.keys()]
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            elapsed = asyncio.get_event_loop().time() - start_time
+            await asyncio.sleep(max(0.0, dt - elapsed))
+
+
+def random_id():
+    return str(uuid.uuid4())
